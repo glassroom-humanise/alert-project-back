@@ -2,7 +2,9 @@
   "dependencies": {
     "@google-cloud/bigquery": "^7.5.0",
     "@google-cloud/storage": "^7.7.0",
+    "axios": "^1.6.8",
     "cors": "^2.8.5",
+    "firebase-functions": "^4.8.0",
     "moment-timezone": "^0.5.45"
   }
 }
