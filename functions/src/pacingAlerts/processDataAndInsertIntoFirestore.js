@@ -9,6 +9,7 @@ exports.processDataAndInsertIntoFirestore = functions
     .region("northamerica-northeast1")
     .https.onCall(async (data, context) => {
       const userSearchId = data.userSearchId;
+      const userId = data.userId;
       const reportJson = data.reportJson;
       const db = admin.firestore();
 
@@ -21,12 +22,8 @@ exports.processDataAndInsertIntoFirestore = functions
       const userSearchData = userSearchDoc.data();
 
       // Recover the user"s email address
-      const userDoc = await db.collection("user")
-          .doc(userSearchData.userId).get();
-      if (!userDoc.exists) {
-        throw new functions.https.HttpsError("not-found", "User not found");
-      }
-      const userEmail = userDoc.data().email;
+      const userRecord = await admin.auth().getUser(userSearchData.userId);
+      const userEmail = userRecord.email;
 
       // Generate ProcessUID
       const processUID = admin.firestore().collection("dummy").doc().id;
@@ -36,32 +33,19 @@ exports.processDataAndInsertIntoFirestore = functions
           (obj) => obj.campaignId);
 
       // Converting date strings into Date objects
-      const startDate = moment.tz(
-          userSearchData.startDate,
-          "YYYY/MM/DD",
-          "America/Montreal",
-      ).startOf("day").toDate();
-      const endDate = moment.tz(
-          userSearchData.endDate,
-          "YYYY/MM/DD",
-          "America/Montreal",
-      ).endOf("day").toDate();
-      const yesterday = moment.tz("America/Montreal").subtract(1, "days")
-          .endOf("day").toDate();
-      const twoDaysAgo = moment.tz("America/Montreal").subtract(2, "days")
-          .endOf("day").toDate();
-      const eightDaysAgo = moment.tz("America/Montreal")
-          .subtract(8, "days").startOf("day").toDate();
+      const startDate = moment.tz(userSearchData.startDate, "MM/DD/YYYY", "America/Montreal").startOf("day").toDate();
+      const endDate = moment.tz(userSearchData.endDate, "MM/DD/YYYY", "America/Montreal").startOf("day").toDate();
+      const yesterday = moment.tz("America/Montreal").subtract(1, "days").startOf("day").toDate();
+      const twoDaysAgo = moment.tz("America/Montreal").subtract(2, "days").startOf("day").toDate();
+      const eightDaysAgo = moment.tz("America/Montreal").subtract(8, "days").startOf("day").toDate();
 
       // Calculation of total number of days and days elapsed
-      const totalDays = (endDate - startDate) / (1000 * 60 * 60 * 24) + 1;
-      const elapsedDays = (yesterday - startDate) / (1000 * 60 * 60 * 24) + 1;
+      const totalDays = moment(endDate).diff(moment(startDate), 'days') + 1;
+      const elapsedDays = moment(yesterday).diff(moment(startDate), 'days') + 1;
 
       // Calculating the percentage of days spent
       let percDaysPassed = totalDays > 0 ? (elapsedDays / totalDays) * 100 : 0;
-      percDaysPassed = Math.round(
-          (percDaysPassed + Number.EPSILON) * 100
-      ) / 100;
+      percDaysPassed = Math.round((percDaysPassed + Number.EPSILON) * 100) / 100;
 
       // Calculate total and daily campaign revenue metrics
       let campaignCost = 0;
@@ -71,16 +55,15 @@ exports.processDataAndInsertIntoFirestore = functions
       let yesterdaySpent = 0;
 
       reportJson.forEach((entry) => {
-        const entryDate = moment.tz(
+        let entryDate = moment.tz(
             entry["Date"],
             "YYYY/MM/DD",
             "America/Montreal",
         ).toDate();
-        const revenue = parseFloat(entry["Revenue (Adv Currency)"]);
-
+        let revenue = parseFloat(entry["Revenue (Adv Currency)"]);
         if (
           entryDate >= startDate &&
-          entryDate <= yesterday && !isNaN(revenue)
+          entryDate <= yesterday
         ) {
           campaignCost += revenue;
         }
@@ -104,6 +87,7 @@ exports.processDataAndInsertIntoFirestore = functions
           yesterdaySpent += revenue;
         }
       });
+      yesterdaySpent = Math.round(yesterdaySpent);
 
       let sevdaysAverageCampaignCost = sevdaysCount > 0 ?
           sevdaysRevenueTotal / Math.min(sevdaysCount, 7) : 0;
@@ -117,9 +101,8 @@ exports.processDataAndInsertIntoFirestore = functions
           Number.EPSILON) * 100) / 100 : 0;
 
       // Calculate the estimated cost
-      const currentDate = moment.tz("America/Montreal").toDate();
-      const daysLeft = (endDate - currentDate) /
-          (1000 * 60 * 60 * 24) + 2;
+      const currentDate = moment.tz("America/Montreal").startOf("day").toDate();
+      const daysLeft = (endDate - currentDate) / (1000 * 60 * 60 * 24) + 2;
 
       const estimatedCost = startDate === moment(currentDate)
           .format("YYYY/MM/DD") ? 0 :
@@ -129,7 +112,7 @@ exports.processDataAndInsertIntoFirestore = functions
       // Calculate the daily and yesterday estimated cost
       const dailyEstimatedCost = (userSearchData.budget - campaignCost) /
           (daysLeft - 1 > 0 ? daysLeft - 1 : 1);
-      const yesterdaySailyEstimatedCost = (userSearchData.budget -
+      const yesterdayDailyEstimatedCost = (userSearchData.budget -
           yesterdayCampaignCost) /
           (daysLeft > 0 ? daysLeft : 1);
 
@@ -138,7 +121,10 @@ exports.processDataAndInsertIntoFirestore = functions
         ProcessUID: processUID,
         CreationTimestamp: admin.firestore.FieldValue.serverTimestamp(),
         CreatedBy: userEmail,
+        userId: userId,
         ClientName: userSearchData.partner.displayName,
+        processDate: moment.tz("America/Montreal").format("YYYY-MM-DD"),
+        processStatus: "New",
         CampaignName: userSearchData.campaignName,
         StartDate: userSearchData.startDate,
         EndDate: userSearchData.endDate,
@@ -154,16 +140,16 @@ exports.processDataAndInsertIntoFirestore = functions
         yesterday_spent: yesterdaySpent,
         estimated_cost: estimatedCost,
         daily_estimated_cost: dailyEstimatedCost,
-        yesterday_daily_estimated_cost: yesterdaySailyEstimatedCost,
+        yesterday_daily_estimated_cost: yesterdayDailyEstimatedCost,
       };
 
       // Get data in BigQuery
-      async function getRefAlertsDetails(errorIDs, query) {
+      async function getRefAlertsDetails(errorID, query) {
         const options = {
           query: query,
-          params: {errorIDs: errorIDs},
+          params: {errorID: errorID}
         };
-
+      
         const [rows] = await bigquery.query(options);
         return rows;
       }
@@ -204,37 +190,44 @@ exports.processDataAndInsertIntoFirestore = functions
       const budgetAlertsErrorTable = calculateBudgetAlerts(metricsTable);
 
       let query = `
-      SELECT * FROM \`masterbackend.GR_Alerts_config.Ref_Alerts_Table\`
-      WHERE error_id IN UNNEST(@errorIDs)`;
+        SELECT * FROM \`masterbackend.GR_Alerts_config.Ref_Alerts_Table\`
+        WHERE error_id = @errorID
+      `;
 
-      let refAlertsDetails = await getRefAlertsDetails(
-          budgetAlertsErrorTable.map((b) => b.error_ID), query);
+      let refAlertsDetails = []
+      if (budgetAlertsErrorTable.error_ID) {
+        refAlertsDetails = await getRefAlertsDetails(budgetAlertsErrorTable.error_ID, query);
+      }
 
       if (refAlertsDetails && refAlertsDetails.length > 0) {
-        const refAlertDetails = refAlertsDetails[0];
+        const refAlertDetail = refAlertsDetails.find((r) => r.error_id === budgetAlertsErrorTable.error_ID);
+        const enrichedData = {
+          ...budgetAlertsErrorTable,
+          error_platform: refAlertDetail.error_platform,
+          error_platform_level: refAlertDetail.error_platform_level,
+          error_pillar: refAlertDetail.error_pillar,
+          error_pillar_type: refAlertDetail.error_pillar_type,
+          error_metric: refAlertDetail.error_metric,
+          error_metric_defintion: refAlertDetail.error_metric_defintion,
+          error_metric_category: refAlertDetail.error_metric_category,
+          error_rule: refAlertDetail.error_rule,
+          error_rule_timeframe: refAlertDetail.error_rule_timeframe,
+          error_rule_status: refAlertDetail.error_rule_status,
+          error_rule_message: refAlertDetail.error_rule_message,
+          error_rule_score: refAlertDetail.error_rule_score,
+        };
 
-        const enrichedData = budgetAlertsErrorTable.map((baet) => {
-          const refAlertDetail = refAlertDetails.find(
-              (r) => r.error_id === baet.error_ID);
-          return {
-            ...baet,
-            error_platform: refAlertDetail.error_platform,
-            error_platform_level: refAlertDetail.error_platform_level,
-            error_pillar: refAlertDetail.error_pillar,
-            error_pillar_type: refAlertDetail.error_pillar_type,
-            error_metric: refAlertDetail.error_metric,
-            error_metric_defintion: refAlertDetail.error_metric_defintion,
-            error_metric_category: refAlertDetail.error_metric_category,
-            error_rule: refAlertDetail.error_rule,
-            error_rule_timeframe: refAlertDetail.error_rule_timeframe,
-            error_rule_status: refAlertDetail.error_rule_status,
-            error_rule_message: refAlertDetail.error_rule_message,
-            error_rule_score: refAlertDetail.error_rule_score,
-          };
-        });
+        const snapshot = await db.collection("Pacing_alerts_interim")
+          .where("processDate", "==", moment.tz("America/Montreal").format("YYYY-MM-DD"))
+          .where("Platform", "==", enrichedData.Platform)
+          .where("userId", "==", userId)
+          .where("CampaignID", "==", enrichedData.CampaignID)
+          .get();
 
-        // Insertion into Firestore
-        await db.collection("Pacing_alerts_interim").doc().set(enrichedData);
+        // Insertion into Firestore 
+        if (snapshot.empty) {
+          await db.collection("Pacing_alerts_interim").doc().set(enrichedData);
+        }
       }
 
 
@@ -245,6 +238,9 @@ exports.processDataAndInsertIntoFirestore = functions
         ProcessUID: metricsTable.ProcessUID,
         CreationTimestamp: metricsTable.CreationTimestamp,
         CreatedBy: metricsTable.CreatedBy,
+        userId: userId,
+        processDate: moment.tz("America/Montreal").format("YYYY-MM-DD"),
+        processStatus: "New",
         ClientName: metricsTable.ClientName,
         CampaignName: metricsTable.CampaignName,
         StartDate: metricsTable.StartDate,
@@ -262,44 +258,44 @@ exports.processDataAndInsertIntoFirestore = functions
 
       // Get error ID and delta value
       function determineErrorIdAndDeltaValue(
-          campaignCost, budget, estimatedCost, percDaysPassed
+          campaignCost, budget, percDaysPassed
       ) {
-        let errorId = "null";
+        let errorId = null;
         let deltaValue = 0;
-
-        const costDifference = campaignCost - estimatedCost;
+        const campaignEstimatedCost = metricsTable.yesterday_campaign_cost + metricsTable.yesterday_daily_estimated_cost;
+        const costDifference = campaignCost - campaignEstimatedCost;
         const absoluteDifferencePercentage = Math.round(
-            Math.abs(costDifference / estimatedCost) * 100);
+            Math.abs(costDifference / campaignEstimatedCost) * 100);
 
-        if (campaignCost < budget && percDaysPassed < 1) {
+        if (campaignCost < budget && percDaysPassed < 100) {
           if (
             absoluteDifferencePercentage === 0 ||
-            (campaignCost === 0 && estimatedCost === 0)
+            (campaignCost === 0 && campaignEstimatedCost === 0)
           ) {
             errorId = "d58127f6";
           } else if (
-            campaignCost > estimatedCost &&
-            campaignCost < (estimatedCost + estimatedCost * 0.05)
+            campaignCost > campaignEstimatedCost &&
+            campaignCost < (campaignEstimatedCost + campaignEstimatedCost * 0.05)
           ) {
             errorId = "7b217b04";
           } else if (
-            campaignCost <= estimatedCost &&
-            campaignCost > (estimatedCost - estimatedCost * 0.05)
+            campaignCost <= campaignEstimatedCost &&
+            campaignCost > (campaignEstimatedCost - campaignEstimatedCost * 0.05)
           ) {
             errorId = "9861010f";
           } else if (
-            campaignCost >= (estimatedCost + estimatedCost * 0.05) &&
-            campaignCost < (estimatedCost + estimatedCost * 0.1)
+            campaignCost >= (campaignEstimatedCost + campaignEstimatedCost * 0.05) &&
+            campaignCost < (campaignEstimatedCost + campaignEstimatedCost * 0.1)
           ) {
             errorId = "2d027066";
           } else if (
-            campaignCost <= (estimatedCost - estimatedCost * 0.05) &&
-            campaignCost > (estimatedCost - estimatedCost * 0.1)
+            campaignCost <= (campaignEstimatedCost - campaignEstimatedCost * 0.05) &&
+            campaignCost > (campaignEstimatedCost - campaignEstimatedCost * 0.1)
           ) {
             errorId = "29f12f5f";
-          } else if (campaignCost >= (estimatedCost + estimatedCost * 0.1)) {
+          } else if (campaignCost >= (campaignEstimatedCost + campaignEstimatedCost * 0.1)) {
             errorId = "6eee195a";
-          } else if (campaignCost <= (estimatedCost - estimatedCost * 0.1)) {
+          } else if (campaignCost <= (campaignEstimatedCost - campaignEstimatedCost * 0.1)) {
             errorId = "daded50d";
           }
         }
@@ -321,12 +317,13 @@ exports.processDataAndInsertIntoFirestore = functions
       query = `
         SELECT * 
         FROM \`masterbackend.GR_Alerts_config.Ref_Alerts_Table\` 
-        WHERE error_id IN UNNEST(@errorIDs)
+        WHERE error_id = @errorID
       `;
 
-      refAlertsDetails = await getRefAlertsDetails(
-          [campaignCostErrorTable.error_ID], query
-      );
+      refAlertsDetails = []
+      if (campaignCostErrorTable.error_ID) {
+        refAlertsDetails = await getRefAlertsDetails(campaignCostErrorTable.error_ID, query);
+      }
 
       if (refAlertsDetails && refAlertsDetails.length > 0) {
         const refAlertDetails = refAlertsDetails[0];
@@ -337,7 +334,7 @@ exports.processDataAndInsertIntoFirestore = functions
           error_pillar: refAlertDetails.error_pillar,
           error_pillar_type: refAlertDetails.error_pillar_type,
           error_metric: refAlertDetails.error_metric,
-          error_metric_definition: refAlertDetails.error_metric_definition,
+          error_metric_definition: refAlertDetails.error_metric_defintion,
           error_metric_category: refAlertDetails.error_metric_category,
           error_rule: refAlertDetails.error_rule,
           error_rule_timeframe: refAlertDetails.error_rule_timeframe,
@@ -346,10 +343,17 @@ exports.processDataAndInsertIntoFirestore = functions
           error_rule_score: refAlertDetails.error_rule_score
         });
 
+        const snapshot = await db.collection("Pacing_alerts_interim")
+          .where("processDate", "==", moment.tz("America/Montreal").format("YYYY-MM-DD"))
+          .where("Platform", "==", campaignCostErrorTable.Platform)
+          .where("userId", "==", userId)
+          .where("CampaignID", "==", campaignCostErrorTable.CampaignID)
+          .get();
 
-        // Insertion into Firestore
-        await db.collection("Pacing_alerts_interim").doc()
-            .set(campaignCostErrorTable);
+        // Insertion into Firestore 
+        if (snapshot.empty) {
+          await db.collection("Pacing_alerts_interim").doc().set(campaignCostErrorTable);
+        }
       }
 
 
@@ -360,6 +364,9 @@ exports.processDataAndInsertIntoFirestore = functions
         ProcessUID: metricsTable.ProcessUID,
         CreationTimestamp: metricsTable.CreationTimestamp,
         CreatedBy: metricsTable.CreatedBy,
+        userId: userId,
+        processDate: moment.tz("America/Montreal").format("YYYY-MM-DD"),
+        processStatus: "New",
         ClientName: metricsTable.ClientName,
         CampaignName: metricsTable.CampaignName,
         StartDate: metricsTable.StartDate,
@@ -372,20 +379,19 @@ exports.processDataAndInsertIntoFirestore = functions
         campaign_cost: metricsTable.campaign_cost,
         yesterday_spent: metricsTable.yesterday_spent,
         estimated_cost: metricsTable.estimated_cost,
-        daily_estimated_cost: metricsTable.daily_estimated_cost,
+        daily_estimated_cost: metricsTable.yesterday_daily_estimated_cost,
       };
 
       // Get error ID and delta value
       function determineYesterdayErrorIdAndDeltaValue(
           yesterdaySpent, yesterdayDailyEstimatedCost, percDaysPassed,
       ) {
-        let errorId = "null";
+        let errorId = null;
         let deltaValue = 0;
 
-        if (percDaysPassed < 1) {
+        if (percDaysPassed < 100) {
           const difference = yesterdaySpent - yesterdayDailyEstimatedCost;
-          const percentageDifference = Math.abs(difference /
-          yesterdayDailyEstimatedCost) * 100;
+          const percentageDifference = Math.abs(difference / yesterdayDailyEstimatedCost) * 100;
 
           if (
             percentageDifference === 0 ||
@@ -423,8 +429,7 @@ exports.processDataAndInsertIntoFirestore = functions
 
         return {errorId, deltaValue};
       }
-
-      const {yesterdayErrorId, yesterdayDeltaValue} =
+      const {errorId: yesterdayErrorId, deltaValue: yesterdayDeltaValue} =
       determineYesterdayErrorIdAndDeltaValue(
           yesterdaySpendErrorsTable.yesterday_spent,
           yesterdaySpendErrorsTable.daily_estimated_cost,
@@ -434,9 +439,10 @@ exports.processDataAndInsertIntoFirestore = functions
       yesterdaySpendErrorsTable.error_ID = yesterdayErrorId;
       yesterdaySpendErrorsTable.delta_value = yesterdayDeltaValue;
 
-      refAlertsDetails = await getRefAlertsDetails(
-          [yesterdaySpendErrorsTable.error_ID], query
-      );
+      refAlertsDetails = []
+      if (yesterdaySpendErrorsTable.error_ID) {
+        refAlertsDetails = await getRefAlertsDetails(yesterdaySpendErrorsTable.error_ID, query);
+      }
 
       if (refAlertsDetails && refAlertsDetails.length > 0) {
         const refAlertDetails = refAlertsDetails[0];
@@ -447,7 +453,7 @@ exports.processDataAndInsertIntoFirestore = functions
           error_pillar: refAlertDetails.error_pillar,
           error_pillar_type: refAlertDetails.error_pillar_type,
           error_metric: refAlertDetails.error_metric,
-          error_metric_definition: refAlertDetails.error_metric_definition,
+          error_metric_definition: refAlertDetails.error_metric_defintion,
           error_metric_category: refAlertDetails.error_metric_category,
           error_rule: refAlertDetails.error_rule,
           error_rule_timeframe: refAlertDetails.error_rule_timeframe,
@@ -456,9 +462,18 @@ exports.processDataAndInsertIntoFirestore = functions
           error_rule_score: refAlertDetails.error_rule_score
         });
 
-        // Insertion into Firestore
-        await db.collection("Pacing_alerts_interim")
-            .doc().set(yesterdaySpendErrorsTable);
+        const snapshot = await db.collection("Pacing_alerts_interim")
+          .where("processDate", "==", moment.tz("America/Montreal").format("YYYY-MM-DD"))
+          .where("Platform", "==", yesterdaySpendErrorsTable.Platform)
+          .where("userId", "==", userId)
+          .where("CampaignID", "==", yesterdaySpendErrorsTable.CampaignID)
+          .where("error_rule", "==", yesterdaySpendErrorsTable.error_rule)
+          .get();
+          
+          // Insertion into Firestore 
+        if (snapshot.empty) {
+          await db.collection("Pacing_alerts_interim").doc().set(yesterdaySpendErrorsTable);
+        }
       }
 
 
@@ -472,13 +487,12 @@ exports.processDataAndInsertIntoFirestore = functions
           budget,
           percDaysPassed,
       ) {
-        let errorId = "null";
+        let errorId = null;
         let deltaValue = 0;
 
-        if (sevdaysAverageCampaignCost < budget && percDaysPassed < 1) {
+        if (sevdaysAverageCampaignCost < budget && percDaysPassed < 100) {
           const diff = sevdaysAverageCampaignCost - yesterdayDailyEstimatedCost;
-          const percentageDiff = yesterdayDailyEstimatedCost !== 0 ?
-          Math.abs(diff / yesterdayDailyEstimatedCost) * 100 : 0;
+          const percentageDiff = yesterdayDailyEstimatedCost !== 0 ? Math.abs(diff / yesterdayDailyEstimatedCost) * 100 : 0;
 
           if (
             percentageDiff === 0 ||
@@ -535,13 +549,15 @@ exports.processDataAndInsertIntoFirestore = functions
       const {errorId: errorIdAvgSevdays, deltaValue: deltaValueAvgSevdays} =
           determineSevdaysErrorIdAndDeltaValue(
               sevdaysAverageCampaignCost,
-              yesterdaySailyEstimatedCost,
+              yesterdayDailyEstimatedCost,
+              metricsTable.Budget,
               metricsTable.perc_days_passed,
           );
-      const errorIDsAvgSevdays = [errorIdAvgSevdays];
-      const refAlertsDetailsAvgSevdays = await getRefAlertsDetails(
-          errorIDsAvgSevdays, query,
-      );
+
+      let refAlertsDetailsAvgSevdays = []
+      if (errorIdAvgSevdays) {
+        refAlertsDetailsAvgSevdays = await getRefAlertsDetails(errorIdAvgSevdays, query);
+      }
 
       if (refAlertsDetailsAvgSevdays && refAlertsDetailsAvgSevdays.length > 0) {
         const refAlertDetailAvgSevdays = refAlertsDetailsAvgSevdays[0];
@@ -553,9 +569,19 @@ exports.processDataAndInsertIntoFirestore = functions
           ...refAlertDetailAvgSevdays,
         };
 
-        // Insertion into Firestore
-        await db.collection("Pacing_alerts_interim")
-            .doc().set(sevdaysErrorsTableData);
+        const snapshot = await db.collection("Pacing_alerts_interim")
+          .where("processDate", "==", moment.tz("America/Montreal").format("YYYY-MM-DD"))
+          .where("Platform", "==", sevdaysErrorsTableData.Platform)
+          .where("userId", "==", userId)
+          .where("CampaignID", "==", sevdaysErrorsTableData.CampaignID)
+          .where("error_rule", "==", sevdaysErrorsTableData.error_rule)
+          .get();
+
+        // Insertion into Firestore 
+        if (snapshot.empty) {
+          await db.collection("Pacing_alerts_interim")
+              .doc().set(sevdaysErrorsTableData);
+        }
       }
 
       // Update error rule message
@@ -595,7 +621,7 @@ exports.processDataAndInsertIntoFirestore = functions
         });
       }
 
-      updateErrorRuleMessages();
+      await updateErrorRuleMessages();
 
       // Insert alert into collection
       async function insertIntoPacingAlertsDatamart() {
@@ -607,9 +633,9 @@ exports.processDataAndInsertIntoFirestore = functions
 
         // Retrieve documents from Pacing_alerts_interim that match the criteria
         const snapshot = await pacingAlertsInterimRef
-            .where("ProcessDate", "==", currentDate)
+            .where("processDate", "==", currentDate)
             .where("Platform", "==", "DV360")
-            .where("ProcessStatus", "==", "New")
+            .where("processStatus", "==", "New")
             .get();
 
         if (snapshot.empty) {
@@ -624,7 +650,7 @@ exports.processDataAndInsertIntoFirestore = functions
           // already exists in Pacing_alerts_datamart
           const datamartSnapshot = await pacingAlertsDatamartRef
               .where("ProcessUID", "==", data.ProcessUID)
-              .where("ProcessDate", "==", currentDate)
+              .where("processDate", "==", currentDate)
               .where("Platform", "==", data.Platform)
               .get();
 
@@ -647,7 +673,7 @@ exports.processDataAndInsertIntoFirestore = functions
         });
       }
 
-      insertIntoPacingAlertsDatamart();
+      await insertIntoPacingAlertsDatamart();
 
       // Insert alert into collection
       async function insertIntoAlertsDatamart() {
@@ -660,7 +686,7 @@ exports.processDataAndInsertIntoFirestore = functions
         // Retrieve all documents from
         // Pacing_alerts_interim that match the criteria
         const snapshot = await pacingAlertsInterimRef
-            .where("ProcessDate", "==", currentDate)
+            .where("processDate", "==", currentDate)
             .where("Platform", "==", "DV360")
             .where("ProcessStatus", "==", "New")
             .get();
@@ -678,7 +704,7 @@ exports.processDataAndInsertIntoFirestore = functions
           // Check if a corresponding document already exists in Alerts_datamart
           const datamartSnapshot = await alertsDatamartRef
               .where("ProcessUID", "==", data.ProcessUID)
-              .where("ProcessDate", "==", currentDate)
+              .where("processDate", "==", currentDate)
               .where("Platform", "==", data.Platform)
               .get();
 
@@ -707,5 +733,5 @@ exports.processDataAndInsertIntoFirestore = functions
         });
       }
 
-      insertIntoAlertsDatamart();
+      await insertIntoAlertsDatamart();
     });
